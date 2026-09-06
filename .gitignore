@@ -1,0 +1,14 @@
+
+# Secret Files
+.env
+.env.local
+*.env
+
+# Dependencies
+node_modules/
+venv/
+__pycache__/
+
+# Next.js Build Output
+.next/
+out/
