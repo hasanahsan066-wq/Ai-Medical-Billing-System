@@ -1,21 +1,3 @@
-from pydantic import BaseModel
-from typing import Optional, List
-
-class PatientCreate(BaseModel):
-    first_name: str
-    last_name: str
-    dob: str
-    insurance_id: Optional[str] = None
-
-class ClaimCreate(BaseModel):
-    patient_id: str
-    diagnosis_codes: List[str]
-    procedure_codes: List[str]
-    total_amount: float
-    status: Optional[str] = "draft"
-
-class MedicalNotesInput(BaseModel):
-    clinical_notes: str
 from typing import Literal
 from pydantic import BaseModel, Field
 
@@ -42,4 +24,21 @@ class ExtractCodesResponse(BaseModel):
     suggestions: list[CodeSuggestion]
     is_fallback: bool = Field(
         default=False, description="Flag indicating if fallback mock data was used"
+    )
+
+
+class ClaimValidationResponse(BaseModel):
+    status: Literal["PASS", "WARNING", "REVIEW_REQUIRED"]
+    risk_score: int = Field(
+        ...,
+        ge=0,
+        le=100,
+        description="Risk level percentage (0=Safe, 100=High Risk)",
+    )
+    issues: list[str] = Field(
+        default_factory=list, description="Detected billing or clinical issues"
+    )
+    recommendations: list[str] = Field(
+        default_factory=list,
+        description="Actionable suggestions for billing staff",
     )
