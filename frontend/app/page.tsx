@@ -1,29 +1,177 @@
 'use client';
 
-import { useState } from 'react';
-import { extractCodes, createClaim, CodeSuggestion } from '@/lib/api';
+import { useState, useEffect } from 'react';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { supabase } from '@/lib/supabaseClient';
+import {
+  extractCodes,
+  createClaim,
+  getWorkflowLogs,
+  sendAssistantQuery,
+  getDashboardStats,
+  CodeSuggestion,
+} from '@/lib/api';
 
 interface ReviewableSuggestion extends CodeSuggestion {
   status: 'pending' | 'approved' | 'rejected';
 }
 
+interface MedicationItem {
+  id: string;
+  name: string;
+  dosage: string;
+  quantity: number;
+  unitPrice: number;
+}
+
+interface ValidationResult {
+  status: 'PASS' | 'WARNING' | 'REVIEW_REQUIRED';
+  risk_score: number;
+  issues: string[];
+  recommendations: string[];
+}
+
 export default function Home() {
-  // Clinical Notes & Extraction State
+  const router = useRouter();
+  const [checkingAuth, setCheckingAuth] = useState(true);
+
+  // --- Auth Session Guard ---
+  useEffect(() => {
+    const checkUserSession = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        router.push('/login');
+      } else {
+        setCheckingAuth(false);
+      }
+    };
+    checkUserSession();
+  }, [router]);
+
+  // States
   const [clinicalNotes, setClinicalNotes] = useState('');
   const [isExtracting, setIsExtracting] = useState(false);
   const [suggestions, setSuggestions] = useState<ReviewableSuggestion[]>([]);
   const [isFallback, setIsFallback] = useState(false);
   const [extractError, setExtractError] = useState<string | null>(null);
 
-  // Claim Form State
   const [patientId, setPatientId] = useState('P-2026-07155');
-  const [patientName, setPatientName] = useState('DELA CRUZ, JUAN MIGUEL');
   const [diagnosisCodes, setDiagnosisCodes] = useState<string[]>([]);
   const [procedureCodes, setProcedureCodes] = useState<string[]>([]);
-  const [totalAmount, setTotalAmount] = useState<number>(12450);
   const [claimStatus, setClaimStatus] = useState<string | null>(null);
+  const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
 
-  // AI Extraction Logic
+  // --- Pharmacy / Medication Billing States ---
+  const [medications, setMedications] = useState<MedicationItem[]>([
+    { id: '1', name: 'Metformin HCl', dosage: '500mg', quantity: 30, unitPrice: 1.5 },
+    { id: '2', name: 'Amoxicillin Trihydrate', dosage: '250mg', quantity: 14, unitPrice: 2.0 },
+  ]);
+  const [newMedName, setNewMedName] = useState('');
+  const [newMedDosage, setNewMedDosage] = useState('');
+  const [newMedQty, setNewMedQty] = useState(1);
+  const [newMedPrice, setNewMedPrice] = useState(5.0);
+
+  // Procedure & Pharmacy Cost Calculations
+  const baseProcedureCost = procedureCodes.length * 150 + 100;
+  const medSubtotal = medications.reduce((sum, item) => sum + item.quantity * item.unitPrice, 0);
+  const totalAmount = baseProcedureCost + medSubtotal;
+
+  // Receipt Modal State
+  const [showReceipt, setShowReceipt] = useState(false);
+
+  // Workflow Logs State
+  const [workflowLogs, setWorkflowLogs] = useState<any[]>([]);
+  const [showWorkflows, setShowWorkflows] = useState(false);
+
+  // AI Chatbot Assistant State
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState<Array<{ sender: 'user' | 'ai'; text: string }>>([
+    {
+      sender: 'ai',
+      text: 'Hello! I am your MEDIBILL AI Assistant. How can I help you audit your claims or manage pharmacy billing today?',
+    },
+  ]);
+  const [chatInput, setChatInput] = useState('');
+  const [isSendingMsg, setIsSendingMsg] = useState(false);
+
+  // Dashboard KPI Stats State
+  const [stats, setStats] = useState({
+    total_claims: 0,
+    total_revenue: 0,
+    high_risk_claims: 0,
+    active_patients: 1,
+  });
+
+  const fetchStats = async () => {
+    try {
+      const data = await getDashboardStats();
+      setStats(data);
+    } catch (err) {
+      console.error('Failed to load stats', err);
+    }
+  };
+
+  useEffect(() => {
+    if (!checkingAuth) {
+      fetchStats();
+    }
+  }, [checkingAuth]);
+
+  // Pharmacy Item Handlers
+  const handleAddMedication = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newMedName.trim()) return;
+    const newItem: MedicationItem = {
+      id: Date.now().toString(),
+      name: newMedName,
+      dosage: newMedDosage || '500mg',
+      quantity: Number(newMedQty) || 1,
+      unitPrice: Number(newMedPrice) || 0,
+    };
+    setMedications([...medications, newItem]);
+    setNewMedName('');
+    setNewMedDosage('');
+    setNewMedQty(1);
+    setNewMedPrice(5.0);
+  };
+
+  const handleRemoveMedication = (id: string) => {
+    setMedications(medications.filter((m) => m.id !== id));
+  };
+
+  const handleFetchWorkflowLogs = async () => {
+    try {
+      const logs = await getWorkflowLogs();
+      setWorkflowLogs(logs);
+      setShowWorkflows(true);
+    } catch (err) {
+      console.error('Failed to fetch workflow logs', err);
+    }
+  };
+
+  const handleSendChatMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim() || isSendingMsg) return;
+
+    const userMsg = chatInput.trim();
+    setChatInput('');
+    setChatMessages((prev) => [...prev, { sender: 'user', text: userMsg }]);
+    setIsSendingMsg(true);
+
+    try {
+      const res = await sendAssistantQuery(userMsg);
+      setChatMessages((prev) => [...prev, { sender: 'ai', text: res.reply }]);
+    } catch (err) {
+      setChatMessages((prev) => [
+        ...prev,
+        { sender: 'ai', text: 'Sorry, I encountered an error connecting to the billing assistant.' },
+      ]);
+    } finally {
+      setIsSendingMsg(false);
+    }
+  };
+
   const handleExtractCodes = async () => {
     if (!clinicalNotes.trim()) return;
     setIsExtracting(true);
@@ -44,7 +192,6 @@ export default function Home() {
     }
   };
 
-  // Approve Suggestion
   const handleApprove = (index: number) => {
     const item = suggestions[index];
     if (item.status === 'approved') return;
@@ -64,7 +211,6 @@ export default function Home() {
     }
   };
 
-  // Reject Suggestion
   const handleReject = (index: number) => {
     const item = suggestions[index];
 
@@ -81,7 +227,6 @@ export default function Home() {
     setSuggestions(updated);
   };
 
-  // Submit Final Claim
   const handleSubmitClaim = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!patientId.trim()) {
@@ -89,28 +234,48 @@ export default function Home() {
       return;
     }
 
+    setClaimStatus(null);
+    setValidationResult(null);
+
     try {
-      await createClaim({
+      const res = await createClaim({
         patient_id: patientId,
         diagnosis_codes: diagnosisCodes,
         procedure_codes: procedureCodes,
         total_amount: Number(totalAmount),
         status: 'submitted',
       });
-      setClaimStatus('Claim & Billing Record Submitted Successfully!');
+
+      setClaimStatus(res.message || 'Claim generated and saved to Supabase!');
+      if (res.claim?.validation) {
+        setValidationResult(res.claim.validation);
+      }
+      fetchStats();
     } catch (err: any) {
       setClaimStatus(`Error: ${err.message}`);
     }
   };
 
+  // Auth Screen Guard Rendering
+  if (checkingAuth) {
+    return (
+      <div className="h-screen bg-[#0a192f] text-white flex flex-col items-center justify-center space-y-3 font-sans">
+        <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin" />
+        <p className="text-xs font-semibold tracking-wider text-slate-300">
+          Authenticating MEDIBILL Session...
+        </p>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex h-screen bg-slate-100 text-slate-800 font-sans overflow-hidden">
+    <div className="flex h-screen bg-slate-100 text-slate-800 font-sans overflow-hidden relative">
       {/* Sidebar Navigation */}
-      <aside className="w-64 bg-[#0a192f] text-slate-300 flex flex-col justify-between shrink-0">
+      <aside className="w-64 bg-[#0a192f] text-slate-300 flex flex-col justify-between shrink-0 shadow-xl border-r border-slate-800">
         <div>
           {/* Brand Header */}
-          <div className="flex items-center space-x-3 p-4 border-b border-slate-800">
-            <div className="w-7 h-7 rounded bg-blue-600 flex items-center justify-center text-white font-bold text-xs">
+          <div className="flex items-center space-x-3 p-5 border-b border-slate-800">
+            <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center text-white font-bold text-xs shadow-md shadow-blue-500/30">
               AI
             </div>
             <span className="font-bold text-white text-base tracking-wide">
@@ -120,70 +285,142 @@ export default function Home() {
 
           {/* Navigation Links */}
           <nav className="p-3 space-y-1 text-sm font-medium">
-            <a href="#" className="flex items-center px-3 py-2.5 rounded-lg hover:bg-slate-800 text-slate-400">
-              <svg className="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 00-1-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
-              Dashboard
-            </a>
-            <a href="#" className="flex items-center px-3 py-2.5 rounded-lg hover:bg-slate-800 text-slate-400">
-              <svg className="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
-              Patient Management
-            </a>
-            <a href="#" className="bg-blue-600 text-white flex items-center px-3 py-2.5 rounded-lg font-semibold shadow-md">
-              <svg className="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
-              Billing & AI Coding
-            </a>
-            <a href="#" className="flex items-center px-3 py-2.5 rounded-lg hover:bg-slate-800 text-slate-400">
-              <svg className="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
-              Reports & Claims
-            </a>
-            <a href="#" className="flex items-center px-3 py-2.5 rounded-lg hover:bg-slate-800 text-slate-400">
-              <svg className="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/></svg>
-              Settings
-            </a>
+            <Link
+              href="/"
+              className="flex items-center space-x-3 px-3.5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold shadow-md shadow-blue-600/30 transition-all duration-200"
+            >
+              <span>📊</span>
+              <span>Dashboard</span>
+            </Link>
+
+            <Link
+              href="/patients"
+              className="flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800/80 hover:translate-x-1 transition-all duration-200 border border-transparent"
+            >
+              <span>👥</span>
+              <span>Patient Management</span>
+            </Link>
+
+            <Link
+              href="/"
+              className="flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800/80 hover:translate-x-1 transition-all duration-200 border border-transparent"
+            >
+              <span>⚡</span>
+              <span>Billing & AI Coding</span>
+            </Link>
+
+            <Link
+              href="/reports"
+              className="flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800/80 hover:translate-x-1 transition-all duration-200 border border-transparent"
+            >
+              <span>📋</span>
+              <span>Reports & Claims</span>
+            </Link>
+
+            <Link
+              href="/settings"
+              className="flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800/80 hover:translate-x-1 transition-all duration-200 border border-transparent"
+            >
+              <span>⚙️</span>
+              <span>Settings</span>
+            </Link>
           </nav>
         </div>
 
-        {/* Footer info */}
-        <div className="p-4 border-t border-slate-800 text-xs text-slate-500">
-          Hospital Information & Management System v2.4
+        {/* Bottom Logout Controls */}
+        <div className="p-4 border-t border-slate-800 flex items-center justify-between text-xs text-slate-500">
+          <span>v2.4</span>
+          <button
+            onClick={async () => {
+              await supabase.auth.signOut();
+              router.push('/login');
+            }}
+            className="text-rose-400 hover:text-rose-300 font-bold transition flex items-center space-x-1"
+          >
+            <span>🚪</span>
+            <span>Logout</span>
+          </button>
         </div>
       </aside>
 
-      {/* Main Container */}
+      {/* Main Workspace */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        {/* Top Header */}
         <header className="bg-[#0b192c] text-white px-6 py-3 flex items-center justify-between shadow-md border-b border-slate-800">
           <div>
-            <h1 className="text-lg font-bold tracking-tight">Billing & Medical Coding Studio</h1>
-            <p className="text-xs text-slate-400">Dashboard &gt; Billing &gt; AI Human-in-the-Loop Review</p>
+            <h1 className="text-lg font-bold tracking-tight">Integrated Billing & Pharmacy Studio</h1>
+            <p className="text-xs text-slate-400">Dashboard &gt; Billing &gt; AI Medical Coding & Pharmacy Charges</p>
           </div>
-          <div className="flex items-center space-x-6 text-xs">
-            <span className="bg-slate-800 px-3 py-1.5 rounded-full border border-slate-700 text-slate-300">
-              📅 September 06, 2026 | 10:30 AM
-            </span>
-            <div className="flex items-center space-x-2">
-              <div className="w-8 h-8 rounded-full bg-blue-500 text-white font-bold flex items-center justify-center border-2 border-slate-700">
-                BS
-              </div>
-              <div>
-                <p className="font-semibold text-white leading-none">Billing Specialist</p>
-                <p className="text-[10px] text-slate-400 mt-0.5">Authorized Cashier</p>
-              </div>
-            </div>
+          <div className="flex items-center space-x-3 text-xs">
+            <button
+              onClick={() => setShowReceipt(true)}
+              className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-3 py-1.5 rounded-lg transition shadow flex items-center space-x-1.5"
+            >
+              <span>🧾</span>
+              <span>Preview Itemized Bill</span>
+            </button>
+            <button
+              onClick={handleFetchWorkflowLogs}
+              className="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white font-semibold px-3 py-1.5 rounded-lg transition shadow flex items-center space-x-1.5"
+            >
+              <span>⚡</span>
+              <span>View Workflows</span>
+            </button>
           </div>
         </header>
 
-        {/* Dynamic Workspace */}
-        <div className="flex-1 p-6 overflow-y-auto space-y-5">
-          {/* Patient Overview Card */}
-          <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-sm flex items-center justify-between">
+        <div className="flex-1 p-6 overflow-y-auto space-y-5 bg-slate-100">
+          {/* Top KPI Summary Cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs flex items-center justify-between">
+              <div>
+                <p className="text-xs text-slate-500 font-semibold uppercase">Total Claims</p>
+                <p className="text-2xl font-black text-slate-900 mt-1">{stats.total_claims}</p>
+              </div>
+              <div className="w-10 h-10 rounded-lg bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-600 text-lg">
+                📄
+              </div>
+            </div>
+
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs flex items-center justify-between">
+              <div>
+                <p className="text-xs text-slate-500 font-semibold uppercase">Total Billed Revenue</p>
+                <p className="text-2xl font-black text-blue-600 mt-1">${stats.total_revenue.toLocaleString()}</p>
+              </div>
+              <div className="w-10 h-10 rounded-lg bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-600 text-lg">
+                💰
+              </div>
+            </div>
+
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs flex items-center justify-between">
+              <div>
+                <p className="text-xs text-slate-500 font-semibold uppercase">High Risk Audit Flags</p>
+                <p className="text-2xl font-black text-rose-600 mt-1">{stats.high_risk_claims}</p>
+              </div>
+              <div className="w-10 h-10 rounded-lg bg-rose-50 border border-rose-200 flex items-center justify-center text-rose-600 text-lg">
+                ⚠️
+              </div>
+            </div>
+
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs flex items-center justify-between">
+              <div>
+                <p className="text-xs text-slate-500 font-semibold uppercase">Active Patients</p>
+                <p className="text-2xl font-black text-purple-600 mt-1">{stats.active_patients}</p>
+              </div>
+              <div className="w-10 h-10 rounded-lg bg-purple-50 border border-purple-200 flex items-center justify-center text-purple-600 text-lg">
+                🏥
+              </div>
+            </div>
+          </div>
+
+          {/* Patient Overview Header */}
+          <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-xs flex items-center justify-between">
             <div className="flex items-center space-x-4">
               <div className="w-12 h-12 rounded-full bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-600 font-bold text-lg">
                 👤
               </div>
               <div>
                 <div className="flex items-center space-x-2">
-                  <h2 className="text-base font-bold text-slate-900">{patientName}</h2>
+                  <h2 className="text-base font-bold text-slate-900">DELA CRUZ, JUAN MIGUEL</h2>
                   <span className="text-xs font-semibold bg-blue-100 text-blue-700 px-2 py-0.5 rounded">
                     {patientId}
                   </span>
@@ -191,85 +428,73 @@ export default function Home() {
                 <div className="flex items-center space-x-4 text-xs text-slate-500 mt-1">
                   <span>Age/Sex: <strong>46 / Male</strong></span>
                   <span>Room/Bed: <strong>201 / A</strong></span>
-                  <span>Admission Date: <strong>09/01/2026</strong></span>
+                  <span>Procedures Subtotal: <strong className="text-slate-800">${baseProcedureCost.toFixed(2)}</strong></span>
+                  <span>Pharmacy Subtotal: <strong className="text-blue-700">${medSubtotal.toFixed(2)}</strong></span>
                 </div>
               </div>
             </div>
 
             <div className="text-right border-l pl-6 border-slate-200">
-              <p className="text-xs text-slate-500 font-medium">TOTAL BALANCE DUE</p>
-              <p className="text-2xl font-black text-purple-700">${totalAmount.toLocaleString()}</p>
+              <p className="text-xs text-slate-500 font-medium">GRAND TOTAL BALANCE DUE</p>
+              <p className="text-2xl font-black text-blue-700">${totalAmount.toFixed(2)}</p>
             </div>
           </div>
 
-          {/* Core Grid Split */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            
-            {/* Left Column: Documentation & AI Review (7 Cols) */}
+            {/* Left Column: AI Clinical Notes & Code Suggestions */}
             <div className="lg:col-span-7 space-y-5">
-              {/* Box 1: Clinical Notes */}
-              <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+              <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
                 <div className="bg-slate-800 text-white px-4 py-2.5 flex items-center justify-between text-xs font-bold uppercase tracking-wider">
                   <span>1. Clinical Documentation Input</span>
-                  <span className="text-blue-400 font-normal">NLP Extraction Pipeline</span>
+                  <span className="text-blue-400 font-normal">Groq NLP Code Extraction</span>
                 </div>
                 <div className="p-4 space-y-3">
                   <textarea
-                    className="w-full h-40 p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 focus:outline-none text-slate-800 text-sm bg-slate-50/50"
-                    placeholder="Paste doctor's clinical notes, examination summaries, or diagnosis details here..."
+                    className="w-full h-32 p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 focus:outline-none text-slate-800 text-sm bg-slate-50/50"
+                    placeholder="Paste doctor's clinical examination notes, diagnoses, or prescribed medications here..."
                     value={clinicalNotes}
                     onChange={(e) => setClinicalNotes(e.target.value)}
                   />
                   <button
                     onClick={handleExtractCodes}
                     disabled={isExtracting || !clinicalNotes.trim()}
-                    className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-semibold py-2.5 rounded-lg transition text-sm flex items-center justify-center space-x-2 shadow"
+                    className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-semibold py-2.5 rounded-lg transition text-sm shadow"
                   >
-                    {isExtracting ? (
-                      <span>Analyzing Clinical Notes via Groq LLM...</span>
-                    ) : (
-                      <span>✨ Run AI Medical Code Extraction</span>
-                    )}
+                    {isExtracting ? 'Analyzing Clinical Notes...' : '✨ Run AI Medical Code Extraction'}
                   </button>
 
                   {extractError && <p className="text-xs text-red-600 font-medium">{extractError}</p>}
-                  {isFallback && (
-                    <div className="bg-amber-50 border border-amber-200 text-amber-800 text-xs p-2.5 rounded-lg">
-                      <strong>Notice:</strong> Groq API unavailable. Fallback mock data loaded.
-                    </div>
-                  )}
                 </div>
               </div>
 
-              {/* Box 2: Interactive AI Suggestions */}
-              <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+              {/* Suggestions Section */}
+              <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
                 <div className="bg-slate-800 text-white px-4 py-2.5 flex items-center justify-between text-xs font-bold uppercase tracking-wider">
-                  <span>2. Human-in-the-Loop Code Suggestions</span>
-                  <span className="text-emerald-400 font-normal">{suggestions.length} Codes Suggested</span>
+                  <span>2. HITL Code Review</span>
+                  <span className="text-blue-400 font-normal">{suggestions.length} Suggested</span>
                 </div>
 
                 <div className="p-4">
                   {suggestions.length === 0 ? (
-                    <div className="h-48 border-2 border-dashed border-slate-200 rounded-lg flex flex-col items-center justify-center text-slate-400 text-xs space-y-1">
-                      <p className="font-semibold text-slate-500">No suggestions generated yet</p>
-                      <p>Enter clinical notes above and click extraction to review codes.</p>
+                    <div className="h-32 border-2 border-dashed border-slate-200 rounded-lg flex flex-col items-center justify-center text-slate-400 text-xs">
+                      No codes generated yet. Enter notes and click extraction.
                     </div>
                   ) : (
-                    <div className="space-y-3 max-h-[380px] overflow-y-auto pr-1">
+                    <div className="space-y-3 max-h-[280px] overflow-y-auto pr-1">
                       {suggestions.map((item, idx) => (
                         <div
                           key={`${item.code}-${idx}`}
-                          className={`p-3.5 rounded-lg border transition ${
+                          className={`p-3 rounded-lg border transition ${
                             item.status === 'approved'
-                              ? 'border-emerald-300 bg-emerald-50/50'
+                              ? 'border-blue-300 bg-blue-50/50'
                               : item.status === 'rejected'
                               ? 'border-slate-200 bg-slate-100 opacity-60'
-                              : 'border-slate-200 bg-white shadow-sm'
+                              : 'border-slate-200 bg-white shadow-xs'
                           }`}
                         >
-                          <div className="flex items-center justify-between">
+                          <div className="flex items-center justify-between text-xs">
                             <div className="flex items-center space-x-2">
-                              <span className="font-black text-slate-900 text-base">{item.code}</span>
+                              <span className="font-black text-slate-900 text-sm">{item.code}</span>
                               <span
                                 className={`text-[10px] font-bold px-2 py-0.5 rounded ${
                                   item.code_type === 'ICD-10'
@@ -280,45 +505,22 @@ export default function Home() {
                                 {item.code_type}
                               </span>
                             </div>
-
-                            <span
-                              className={`text-[11px] font-bold px-2 py-0.5 rounded ${
-                                item.confidence_score >= 85
-                                  ? 'bg-emerald-100 text-emerald-800'
-                                  : item.confidence_score >= 70
-                                  ? 'bg-amber-100 text-amber-800'
-                                  : 'bg-rose-100 text-rose-800'
-                              }`}
-                            >
-                              {item.confidence_score}% Match
-                            </span>
+                            <span className="font-bold text-blue-700">{item.confidence_score}% Match</span>
                           </div>
-
                           <p className="text-xs font-semibold text-slate-800 mt-1">{item.description}</p>
-                          <p className="text-[11px] text-slate-500 mt-1">
-                            <strong className="text-slate-600">Reasoning:</strong> {item.reason}
-                          </p>
 
                           <div className="flex items-center justify-end space-x-2 mt-2 pt-2 border-t border-slate-100">
                             <button
                               onClick={() => handleReject(idx)}
                               disabled={item.status === 'rejected'}
-                              className={`text-xs px-3 py-1 rounded font-medium border transition ${
-                                item.status === 'rejected'
-                                  ? 'bg-slate-200 text-slate-500 border-transparent'
-                                  : 'border-slate-300 hover:bg-slate-100 text-slate-700'
-                              }`}
+                              className="text-xs px-2.5 py-1 rounded font-medium border border-slate-300 hover:bg-slate-100 text-slate-700"
                             >
-                              {item.status === 'rejected' ? 'Rejected' : 'Reject'}
+                              Reject
                             </button>
                             <button
                               onClick={() => handleApprove(idx)}
                               disabled={item.status === 'approved'}
-                              className={`text-xs px-3 py-1 rounded font-medium transition ${
-                                item.status === 'approved'
-                                  ? 'bg-emerald-600 text-white'
-                                  : 'bg-blue-600 hover:bg-blue-700 text-white'
-                              }`}
+                              className="text-xs px-2.5 py-1 rounded font-medium bg-blue-600 hover:bg-blue-700 text-white"
                             >
                               {item.status === 'approved' ? 'Approved ✓' : 'Approve'}
                             </button>
@@ -331,102 +533,276 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Right Column: Real-time Claim Form & Submission (5 Cols) */}
+            {/* Right Column: Pharmacy Itemization & Final Claim Submission */}
             <div className="lg:col-span-5 space-y-5">
-              <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden sticky top-0">
+              {/* Pharmacy & Medication Billing Module */}
+              <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
                 <div className="bg-blue-600 text-white px-4 py-2.5 flex items-center justify-between text-xs font-bold uppercase tracking-wider">
-                  <span>3. Claim Auto-Fill & Review</span>
-                  <span className="bg-blue-700 text-white text-[10px] px-2 py-0.5 rounded">Form 3</span>
+                  <span>3. Pharmacy & Medication Charges</span>
+                  <span className="bg-blue-700 text-white text-[10px] px-2 py-0.5 rounded font-mono">
+                    Subtotal: ${medSubtotal.toFixed(2)}
+                  </span>
                 </div>
 
-                <form onSubmit={handleSubmitClaim} className="p-4 space-y-4">
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-600 mb-1">Patient ID Reference</label>
-                    <input
-                      type="text"
-                      required
-                      className="w-full p-2 border border-slate-300 rounded text-xs text-slate-800 bg-slate-50"
-                      value={patientId}
-                      onChange={(e) => setPatientId(e.target.value)}
-                    />
+                <div className="p-4 space-y-3">
+                  {/* Prescribed Meds Table */}
+                  <div className="border border-slate-200 rounded-lg overflow-hidden">
+                    <table className="w-full text-left text-xs">
+                      <thead className="bg-slate-100 text-slate-600 uppercase font-semibold text-[10px]">
+                        <tr>
+                          <th className="p-2">Medication</th>
+                          <th className="p-2">Dosage</th>
+                          <th className="p-2">Qty</th>
+                          <th className="p-2">Price</th>
+                          <th className="p-2 text-right">Total</th>
+                          <th className="p-2"></th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 text-slate-800">
+                        {medications.map((m) => (
+                          <tr key={m.id} className="hover:bg-slate-50">
+                            <td className="p-2 font-semibold">{m.name}</td>
+                            <td className="p-2 text-slate-500">{m.dosage}</td>
+                            <td className="p-2 font-bold">{m.quantity}</td>
+                            <td className="p-2">${m.unitPrice.toFixed(2)}</td>
+                            <td className="p-2 font-bold text-blue-700 text-right">
+                              ${(m.quantity * m.unitPrice).toFixed(2)}
+                            </td>
+                            <td className="p-2 text-right">
+                              <button
+                                onClick={() => handleRemoveMedication(m.id)}
+                                className="text-rose-500 hover:text-rose-700 font-bold px-1"
+                              >
+                                ✕
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
 
-                  {/* Approved ICD-10 Box */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-600 mb-1">
-                      Approved Diagnosis Codes (ICD-10)
-                    </label>
-                    <div className="min-h-[46px] p-2 border border-slate-200 rounded-lg bg-slate-50 flex flex-wrap gap-1.5 items-center">
-                      {diagnosisCodes.length === 0 ? (
-                        <span className="text-[11px] text-slate-400 italic">No ICD-10 codes approved yet</span>
-                      ) : (
-                        diagnosisCodes.map((code) => (
-                          <span
-                            key={code}
-                            className="bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded font-bold border border-blue-200 flex items-center space-x-1"
-                          >
-                            <span>{code}</span>
-                          </span>
-                        ))
-                      )}
+                  {/* Add Medication Form */}
+                  <form onSubmit={handleAddMedication} className="bg-slate-50 p-2.5 rounded-lg border border-slate-200 space-y-2">
+                    <p className="text-[11px] font-bold text-slate-700">+ Add Prescribed Medicine</p>
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <input
+                        type="text"
+                        placeholder="Medicine Name (e.g. Paracetamol)"
+                        required
+                        className="p-1.5 border border-slate-300 rounded bg-white text-slate-800"
+                        value={newMedName}
+                        onChange={(e) => setNewMedName(e.target.value)}
+                      />
+                      <input
+                        type="text"
+                        placeholder="Dosage (e.g. 500mg)"
+                        className="p-1.5 border border-slate-300 rounded bg-white text-slate-800"
+                        value={newMedDosage}
+                        onChange={(e) => setNewMedDosage(e.target.value)}
+                      />
+                      <input
+                        type="number"
+                        placeholder="Qty"
+                        min="1"
+                        required
+                        className="p-1.5 border border-slate-300 rounded bg-white text-slate-800"
+                        value={newMedQty}
+                        onChange={(e) => setNewMedQty(Number(e.target.value))}
+                      />
+                      <input
+                        type="number"
+                        step="0.01"
+                        placeholder="Unit Price ($)"
+                        required
+                        className="p-1.5 border border-slate-300 rounded bg-white text-slate-800"
+                        value={newMedPrice}
+                        onChange={(e) => setNewMedPrice(Number(e.target.value))}
+                      />
                     </div>
-                  </div>
+                    <button
+                      type="submit"
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-1.5 rounded text-xs transition shadow-xs"
+                    >
+                      Add Medicine to Bill
+                    </button>
+                  </form>
+                </div>
+              </div>
 
-                  {/* Approved CPT Box */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-600 mb-1">
-                      Approved Procedure Codes (CPT)
-                    </label>
-                    <div className="min-h-[46px] p-2 border border-slate-200 rounded-lg bg-slate-50 flex flex-wrap gap-1.5 items-center">
-                      {procedureCodes.length === 0 ? (
-                        <span className="text-[11px] text-slate-400 italic">No CPT codes approved yet</span>
-                      ) : (
-                        procedureCodes.map((code) => (
-                          <span
-                            key={code}
-                            className="bg-purple-100 text-purple-800 text-xs px-2 py-1 rounded font-bold border border-purple-200 flex items-center space-x-1"
-                          >
-                            <span>{code}</span>
-                          </span>
-                        ))
-                      )}
-                    </div>
-                  </div>
+              {/* Claim Final Submission */}
+              <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
+                <div className="bg-[#0b192c] text-white px-4 py-2.5 flex items-center justify-between text-xs font-bold uppercase tracking-wider">
+                  <span>4. Claim Submission</span>
+                  <span className="bg-blue-600 text-white text-[10px] px-2 py-0.5 rounded">Form 4</span>
+                </div>
 
-                  {/* Billing Financial Summary */}
-                  <div className="border-t border-slate-200 pt-3 space-y-1.5 text-xs">
-                    <div className="flex justify-between text-slate-500">
-                      <span>Base Consultation Fee</span>
-                      <span>$250.00</span>
-                    </div>
-                    <div className="flex justify-between text-slate-500">
-                      <span>Extracted Procedure Charges</span>
-                      <span>${(procedureCodes.length * 450).toFixed(2)}</span>
-                    </div>
-                    <div className="flex justify-between text-slate-900 font-bold text-sm pt-2 border-t">
-                      <span>Total Estimated Claim</span>
-                      <span className="text-blue-700">${totalAmount.toLocaleString()}</span>
+                <form onSubmit={handleSubmitClaim} className="p-4 space-y-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1">Approved Codes Summary</label>
+                    <div className="p-2 border border-slate-200 rounded-lg bg-slate-50 text-xs text-slate-700 font-mono">
+                      ICD-10: {diagnosisCodes.join(', ') || 'None'} | CPT: {procedureCodes.join(', ') || 'None'}
                     </div>
                   </div>
 
                   <button
                     type="submit"
-                    className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2.5 rounded-lg transition text-xs uppercase tracking-wider shadow-md"
+                    className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 rounded-lg transition text-xs uppercase tracking-wider shadow-md"
                   >
-                    Generate & Record Final Claim
+                    Submit Complete Claim (${totalAmount.toFixed(2)})
                   </button>
 
                   {claimStatus && (
-                    <p className="text-xs text-center font-bold text-emerald-600 bg-emerald-50 p-2 rounded border border-emerald-200">
+                    <p className="text-xs text-center font-bold p-2 rounded border text-blue-700 bg-blue-50 border-blue-200">
                       {claimStatus}
                     </p>
                   )}
                 </form>
               </div>
             </div>
-
           </div>
         </div>
+      </div>
+
+      {/* Itemized Hospital Receipt Modal */}
+      {showReceipt && (
+        <div className="fixed inset-0 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center z-50 p-4">
+          <div className="bg-white w-full max-w-xl rounded-2xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[90vh]">
+            <div className="bg-[#0b192c] text-white px-5 py-3.5 flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <span className="text-blue-400 font-bold text-lg">🧾</span>
+                <h3 className="font-bold text-sm tracking-wide">Formal Itemized Hospital Invoice</h3>
+              </div>
+              <button
+                onClick={() => setShowReceipt(false)}
+                className="text-slate-400 hover:text-white text-lg font-bold px-2"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-6 overflow-y-auto space-y-4 text-xs font-sans">
+              {/* Receipt Header */}
+              <div className="border-b border-slate-200 pb-3 flex justify-between items-start">
+                <div>
+                  <h2 className="text-base font-black text-slate-900">MEDIBILL HEALTHCARE CENTER</h2>
+                  <p className="text-[11px] text-slate-500">NPI: 1234567890 | Tax ID: XX-XXX9823</p>
+                  <p className="text-[11px] text-slate-500">Narowal Road, Punjab, Pakistan</p>
+                </div>
+                <div className="text-right">
+                  <p className="font-mono font-bold text-blue-700">INV-2026-9921</p>
+                  <p className="text-[10px] text-slate-400">{new Date().toLocaleDateString()}</p>
+                </div>
+              </div>
+
+              {/* Patient Info */}
+              <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 grid grid-cols-2 gap-2 text-[11px]">
+                <div>Patient Name: <strong className="text-slate-900">DELA CRUZ, JUAN MIGUEL</strong></div>
+                <div>Patient ID: <strong className="text-blue-700">{patientId}</strong></div>
+                <div>Admission Date: <strong>09/01/2026</strong></div>
+                <div>Attending Doctor: <strong>Dr. Hasan bin Ahsan</strong></div>
+              </div>
+
+              {/* Diagnoses / CPT Codes */}
+              <div>
+                <p className="font-bold text-slate-900 mb-1 border-b pb-1">Medical Procedures & Codes</p>
+                <div className="flex justify-between py-1 text-slate-700">
+                  <span>General Outpatient Consultation & Code Audit</span>
+                  <span className="font-bold">${baseProcedureCost.toFixed(2)}</span>
+                </div>
+              </div>
+
+              {/* Prescribed Medications */}
+              <div>
+                <p className="font-bold text-slate-900 mb-1 border-b pb-1">Prescribed Medicines & Pharmacy Charges</p>
+                {medications.map((m) => (
+                  <div key={m.id} className="flex justify-between py-1 text-slate-700">
+                    <span>{m.name} ({m.dosage}) x {m.quantity}</span>
+                    <span className="font-bold">${(m.quantity * m.unitPrice).toFixed(2)}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* Total Calculation */}
+              <div className="bg-[#0a192f] text-white p-3.5 rounded-xl flex justify-between items-center text-sm">
+                <span className="font-bold">Total Payable Amount:</span>
+                <span className="font-black text-blue-400 text-lg">${totalAmount.toFixed(2)}</span>
+              </div>
+            </div>
+
+            <div className="p-3 bg-slate-100 border-t border-slate-200 flex justify-end space-x-2">
+              <button
+                onClick={() => window.print()}
+                className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-4 py-2 rounded-lg text-xs transition shadow-md"
+              >
+                🖨️ Print Official Receipt
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating AI Assistant Widget */}
+      <div className="fixed bottom-6 right-6 z-50">
+        {!isChatOpen ? (
+          <button
+            onClick={() => setIsChatOpen(true)}
+            className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-4 py-3 rounded-full shadow-2xl flex items-center space-x-2 transition transform hover:scale-105"
+          >
+            <span className="text-lg">🤖</span>
+            <span className="text-xs">AI Billing Copilot</span>
+          </button>
+        ) : (
+          <div className="bg-white w-80 sm:w-96 rounded-2xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col h-[450px]">
+            <div className="bg-[#0b192c] text-white p-3.5 flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <div className="w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center font-bold text-xs">🤖</div>
+                <div>
+                  <h4 className="font-bold text-xs">MEDIBILL AI Assistant</h4>
+                  <p className="text-[10px] text-slate-400">Pharmacy & Billing Copilot</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsChatOpen(false)}
+                className="text-slate-400 hover:text-white font-bold text-sm px-2"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="flex-1 p-3 overflow-y-auto space-y-2.5 text-xs bg-slate-50">
+              {chatMessages.map((msg, idx) => (
+                <div key={idx} className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div
+                    className={`max-w-[80%] p-2.5 rounded-xl ${
+                      msg.sender === 'user'
+                        ? 'bg-blue-600 text-white rounded-br-none'
+                        : 'bg-white text-slate-800 border border-slate-200 shadow-2xs rounded-bl-none'
+                    }`}
+                  >
+                    {msg.text}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <form onSubmit={handleSendChatMessage} className="p-2.5 bg-white border-t border-slate-200 flex space-x-2">
+              <input
+                type="text"
+                placeholder="Ask e.g. What is the pharmacy total?"
+                className="flex-1 text-xs p-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-600"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+              />
+              <button
+                type="submit"
+                className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-3 py-2 rounded-lg text-xs transition"
+              >
+                Send
+              </button>
+            </form>
+          </div>
+        )}
       </div>
     </div>
   );
