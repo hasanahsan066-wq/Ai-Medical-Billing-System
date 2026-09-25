@@ -230,20 +230,18 @@ export default function Home() {
         status: 'Active',
       });
 
-      const createdObj = res.patient || {
-        id: `P-2026-${Math.floor(10000 + Math.random() * 90000)}`,
-        full_name: newPatient.full_name,
-        age: Number(newPatient.age),
-        gender: newPatient.gender,
-        room_bed: newPatient.room_bed || '101 / A',
-      };
-
-      setPatientsList((prev) => [createdObj, ...prev]);
-      setSelectedPatient(createdObj);
-      setShowAddPatientModal(false);
-      setNewPatient({ full_name: '', age: '', gender: 'Male', room_bed: '101 / A' });
-    } catch (err) {
+      if (res && res.patient) {
+        setPatientsList((prev) => [res.patient, ...prev]);
+        setSelectedPatient(res.patient);
+        setShowAddPatientModal(false);
+        setNewPatient({ full_name: '', age: '', gender: 'Male', room_bed: '101 / A' });
+        alert('Patient successfully registered in Supabase!');
+      } else {
+        alert('Failed to register patient in database. Check backend logs.');
+      }
+    } catch (err: any) {
       console.error('Failed to create patient:', err);
+      alert(`Error registering patient: ${err.message || 'Unknown error'}`);
     }
   };
 
